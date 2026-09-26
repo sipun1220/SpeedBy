@@ -104,8 +104,6 @@ export async function measureDownload(
   const sizes = [1_000_000, 4_000_000, 10_000_000];
   const start = performance.now();
   let totalBytes = 0;
-  let streams = 0;
-  const maxStreams = 6;
 
   async function worker() {
     while (performance.now() - start < durationMs) {
@@ -135,17 +133,19 @@ export async function measureDownload(
     }
   }
 
-  const workers: Promise<void>[] = [];
-  // Ramp up streams gradually like Cloudflare
-  for (let i = 0; i < 3; i++) {
-    workers.push(worker());
-    streams++;
+  // Ramp up streams gradually like Cloudflare, but await ALL of them.
+  // Old code pushed late workers via setTimeout after Promise.all()
+  // had already snapshotted the array, leaking fetches into the upload phase.
+  const maxStreams = 6;
+  const allWorkers: Promise<void>[] = [];
+  for (let i = 0; i < 3; i++) allWorkers.push(worker());
+  // Let the first 3 run for 2.5s, then add 3 more (same deadline).
+  await new Promise((r) => setTimeout(r, Math.min(2500, durationMs / 2)));
+  if (performance.now() - start < durationMs) {
+    for (let i = 3; i < maxStreams; i++) allWorkers.push(worker());
   }
-  setTimeout(() => {
-    for (let i = streams; i < maxStreams; i++) workers.push(worker());
-  }, 2500);
 
-  await Promise.all(workers);
+  await Promise.all(allWorkers);
   const elapsedSec = (performance.now() - start) / 1000;
   const avgMbps = (totalBytes * 8) / elapsedSec / 1_000_000;
   return avgMbps;
@@ -160,8 +160,16 @@ export async function measureUpload(
 
   function makePayload(size: number): Uint8Array {
     const arr = new Uint8Array(size);
-    // Fill with pseudo-random but fast
-    for (let i = 0; i < size; i += 1024) arr[i] = (Math.random() * 256) | 0;
+    // Fill EVERY byte with fast xorshift pseudo-random.
+    // Old code filled 1 byte per 1024 (99.9% zeros) which is
+    // highly compressible and inflates results through proxies.
+    let x = (Math.random() * 0xffffffff) >>> 0 || 0x9e3779b9;
+    for (let i = 0; i < size; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      arr[i] = x & 0xff;
+    }
     return arr;
   }
 
